@@ -149,39 +149,69 @@ def main():
     api = OpalstackAPITool(API_HOST, API_BASE_URI, args.opal_token, args.opal_user, args.opal_password)
     appinfo = api.get(f'/app/read/{args.app_uuid}')
     appdir = f'/home/{appinfo["osuser_name"]}/apps/{appinfo["name"]}'
+    node_file = f'{appdir}/{os.path.basename(LTS_NODE_URL)}'
+    ghost_app_dir = f'{appdir}/app'
+    ghost_bin = f'{appdir}/node_modules/.bin/ghost'
 
     # get current LTS nodejs
     cmd = f'mkdir -p {appdir}/node'
     doit = run_command(cmd)
-    download(LTS_NODE_URL, f'{appdir}/node.tar.xz')
-    cmd = f'tar xf {appdir}/node.tar.xz --strip 1'
+    download(LTS_NODE_URL, node_file)
+    cmd = f'tar xf {node_file} --strip 1'
     doit = run_command(cmd, cwd=f'{appdir}/node')
     CMD_ENV['PATH'] = f'{appdir}/node/bin:{CMD_ENV["PATH"]}'
+    cmd = f'rm {node_file}'
+    doit = run_command(cmd)
 
     # install ghostcli
     # TODO: remove sleep after race is figured out
-    cmd = f'sleep 10'
+    cmd = 'sleep 10'
     doit = run_command(cmd, cwd=appdir)
-    cmd = f'npm install ghost-cli@latest'
+    cmd = 'npm install ghost-cli@latest'
     doit = run_command(cmd, cwd=appdir)
     cmd = f'''sed -i -e 's/mode.others.read/mode.owner.read/' {appdir}/node_modules/ghost-cli/lib/commands/doctor/checks/check-directory.js'''
     doit = run_command(cmd, cwd=appdir)
 
     # install ghost instance
-    cmd = f'mkdir {appdir}/ghost'
+    cmd = f'mkdir {ghost_app_dir}'
     doit = run_command(cmd)
-    cmd = f'{appdir}/node_modules/.bin/ghost install local --port {appinfo["port"]} --log file'
-    doit = run_command(cmd, cwd=f'{appdir}/ghost')
+    cmd = f'{ghost_bin} install local --port {appinfo["port"]} --log file'
+    doit = run_command(cmd, cwd=ghost_app_dir)
 
     # update ghost config to put logs in log dir
-    cmd = f'{appdir}/node_modules/.bin/ghost config set logging[\'path\'] \'/home/{appinfo["osuser_name"]}/logs/apps/{appinfo["name"]}/\''
-    doit = run_command(cmd, cwd=f'{appdir}/ghost')
+    cmd = f'{ghost_bin} config set logging[\'path\'] \'/home/{appinfo["osuser_name"]}/logs/apps/{appinfo["name"]}/\''
+    doit = run_command(cmd, cwd=ghost_app_dir)
+
+    # production ready
+    cmd = f'mv {ghost_app_dir}/config.development.json {ghost_app_dir}/config.production.json'
+    doit = run_command(cmd)
+
+    # .env file
+    dotenv_file = textwrap.dedent(f'''\
+                # Backup main $PATH and activate this node version.
+                [ -z "$MAIN_PATH" ] && MAIN_PATH=$PATH
+                grep -q ":{appdir}/node/bin:" <<< ":$PATH:" || PATH={appdir}/node/bin:$MAIN_PATH
+
+                # Activate production mode.
+                NODE_ENV=production
+                ''')
+    create_file(f'{appdir}/.env', dotenv_file, perms=0o600)
+
+    # ghost script
+    ghost_script = textwrap.dedent(f'''\
+                #!/bin/bash
+                . {appdir}/.env
+                cd {ghost_app_dir}
+                {ghost_bin} $*
+                cd - > /dev/null
+                ''')
+    create_file(f'{appdir}/ghost', ghost_script, perms=0o700)
 
     # start script
     start_script = textwrap.dedent(f'''\
                 #!/bin/bash
                 PATH={appdir}/node/bin:$PATH
-                {appdir}/node_modules/.bin/ghost start -d {appdir}/ghost
+                {ghost_bin} start -d {ghost_app_dir}
                 echo "Started Ghost for {appinfo["name"]}."
                 ''')
     create_file(f'{appdir}/start', start_script, perms=0o700)
@@ -190,7 +220,7 @@ def main():
     stop_script = textwrap.dedent(f'''\
                 #!/bin/bash
                 PATH={appdir}/node/bin:$PATH
-                {appdir}/node_modules/.bin/ghost stop -d {appdir}/ghost
+                {ghost_bin} stop -d {ghost_app_dir}
                 echo "Stopped Ghost for {appinfo["name"]}."
                 ''')
     create_file(f'{appdir}/stop', stop_script, perms=0o700)
@@ -206,26 +236,40 @@ def main():
 
                 ## Post-Install Steps - IMPORTANT!
 
-                1. Assign your {args.app_name} application to a Site Route in
+                1. Optional: Create a MySQL database in your control panel and
+                   make a note of the database name, username, and password.
+                   Then SSH to the server as your app's shell user and run the
+                   following commands to configure it:
+
+                   Note: The first command is to remove the setting for the
+                         default SQLite database file.
+
+                    {appdir}/ghost config database.connection null
+
+                    {appdir}/ghost config database.client mysql
+                    {appdir}/ghost config database.connection.host 127.0.0.1
+                    {appdir}/ghost config database.connection.port 3306
+                    {appdir}/ghost config database.connection.database {args.app_name}
+                    {appdir}/ghost config database.connection.user {args.app_name}
+                    {appdir}/ghost config database.connection.password your_password
+                    {appdir}/ghost restart
+
+                   You may also delete the SQLite database:
+
+                    rm {ghost_app_dir}/content/data/ghost-local.db
+
+                2. Assign your {args.app_name} application to a Site Route in
                    your control panel and make a note of the site URL.
 
-                2. SSH to the server as your app's shell user and run the
+                3. SSH to the server as your app's shell user and run the
                    following commands to configure the site URL, for example
                    https://domain.com:
 
-                    cd {appdir}/ghost
-                    {appdir}/node_modules/.bin/ghost config url https://domain.com
-                    {appdir}/node_modules/.bin/ghost restart
+                    {appdir}/ghost config url https://domain.com
+                    {appdir}/ghost restart
 
-                3. Immediately visit your Ghost admin URL (for example
+                4. Immediately visit your Ghost admin URL (for example
                    https://domain.com/ghost/) to set up your initial admin user.
-
-                ## Production mode
-
-                Your Ghost app is initially configured to run in development
-                mode which uses more memory and is slower than production mode.
-                To run in production mode please see:
-                https://help.opalstack.com/article/122/running-ghost-in-production-mode
 
 
                 ## Controlling your app
@@ -236,8 +280,7 @@ def main():
 
                 or
 
-                    {appdir}/node_modules/.bin/ghost start -d {appdir}/ghost
-
+                    {appdir}/ghost start -d {ghost_app_dir}
 
 
                 Stop your app by running:
@@ -246,7 +289,8 @@ def main():
 
                 or
 
-                   {appdir}/node_modules/.bin/ghost stop -d {appdir}/ghost
+                   {appdir}/ghost stop -d {ghost_app_dir}
+
 
                 ## Installing modules
 
@@ -259,8 +303,8 @@ def main():
     create_file(f'{appdir}/README', readme)
 
     # restart it
-    cmd = f'{appdir}/node_modules/.bin/ghost restart'
-    doit = run_command(cmd, cwd=f'{appdir}/ghost')
+    cmd = f'{appdir}/ghost restart'
+    doit = run_command(cmd, cwd=ghost_app_dir)
 
     # finished, push a notice
     msg = f'Post-install configuration is required, see README in app directory for more info.'
